@@ -44,8 +44,8 @@ import transformers
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
-from alignment import ScriptArguments, SFTConfig, get_dataset, get_model, get_tokenizer
-from trl import ModelConfig, SFTTrainer, TrlParser, get_peft_config, setup_chat_format
+from alignment import ScriptArguments, SFTConfig, SFTTrainer, get_dataset, get_model, get_tokenizer
+from trl import ModelConfig, TrlParser, get_peft_config, setup_chat_format
 
 
 logger = logging.getLogger(__name__)

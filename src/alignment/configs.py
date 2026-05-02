@@ -137,6 +137,25 @@ class SFTConfig(trl.SFTConfig):
     """
 
     chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+    topk_ce_k: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "If set, restrict the cross-entropy softmax normalizer to the top-k logits per "
+                "position. The ground-truth token is always kept in the subset. Disabled when None."
+            )
+        },
+    )
+    topk_ce_p: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "If set in (0, 1), restrict the cross-entropy softmax normalizer to the minimal "
+                "nucleus (top-p) set per position. Applied after top-k when both are set. "
+                "Disabled when None."
+            )
+        },
+    )
 
 
 @dataclass
