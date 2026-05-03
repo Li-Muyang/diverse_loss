@@ -4,25 +4,102 @@ import torch
 import torch.nn.functional as F
 
 
-def _topk_keep_mask(logits: torch.Tensor, k: int) -> torch.Tensor:
-    _, topk_idx = torch.topk(logits, k, dim=-1)
-    keep = torch.zeros_like(logits, dtype=torch.bool)
-    keep.scatter_(-1, topk_idx, True)
-    return keep
+def _plain_ce(logits, labels, num_items_in_batch, ignore_index):
+    logits = logits.float()
+    reduction = "sum" if num_items_in_batch is not None else "mean"
+    loss = F.cross_entropy(logits, labels, ignore_index=ignore_index, reduction=reduction)
+    if num_items_in_batch is not None:
+        loss = loss / num_items_in_batch
+    return loss
 
 
-def _topp_keep_mask(logits: torch.Tensor, p: float) -> torch.Tensor:
-    """Minimal nucleus set: smallest set of highest-prob tokens whose cumulative probability
-    is >= p. The top-1 is always kept.
+def _reduce(loss_per_token, valid, num_items_in_batch):
+    """Reduce per-token loss, ignoring invalid positions, matching HF's grad-accum convention."""
+    loss_per_token = torch.where(valid, loss_per_token, torch.zeros_like(loss_per_token))
+    if num_items_in_batch is not None:
+        return loss_per_token.sum() / num_items_in_batch
+    n_valid = valid.sum().clamp(min=1)
+    return loss_per_token.sum() / n_valid
+
+
+def _topk_ce(logits, labels, valid, safe_labels, k, num_items_in_batch, ignore_index):
+    """Top-k CE computed from gathered (N, k) slices — never materializes (N, V) masks."""
+    # (N, k) values and indices, already sorted descending by value.
+    topk_vals, topk_idx = torch.topk(logits, k, dim=-1)
+    topk_vals = topk_vals.float()
+    label_logit = logits.gather(-1, safe_labels.unsqueeze(-1)).float()  # (N, 1)
+
+    label_in_set = (topk_idx == safe_labels.unsqueeze(-1)).any(dim=-1, keepdim=True)  # (N, 1)
+    # Append label logit to the normalizer, but -inf it out when label is already in top-k
+    # to avoid double-counting.
+    extra = torch.where(label_in_set, torch.full_like(label_logit, float("-inf")), label_logit)
+    lse = torch.logsumexp(torch.cat([topk_vals, extra], dim=-1), dim=-1)  # (N,)
+
+    loss_per_token = lse - label_logit.squeeze(-1)
+    loss = _reduce(loss_per_token, valid, num_items_in_batch)
+
+    n_valid = valid.sum()
+    label_in_subset = (
+        ((label_in_set.squeeze(-1) & valid).sum().float() / n_valid.clamp(min=1)).item()
+        if n_valid > 0 else 1.0
+    )
+    return loss, label_in_subset
+
+
+def _topp_ce(logits, labels, valid, safe_labels, p, num_items_in_batch, ignore_index):
+    """Top-p CE. Still requires a full sort of logits (inherent to nucleus selection), but
+    avoids the extra scatter-back and masked-fill on the original (N, V) tensor.
     """
-    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+    logits = logits.float()
+    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)  # (N, V)
     probs = F.softmax(sorted_logits, dim=-1)
     cumprobs = probs.cumsum(dim=-1)
-    keep_sorted = (cumprobs - probs) < p
-    keep_sorted[..., 0] = True
-    keep = torch.zeros_like(logits, dtype=torch.bool)
-    keep.scatter_(-1, sorted_idx, keep_sorted)
-    return keep
+    keep = (cumprobs - probs) < p
+    keep[..., 0] = True
+    # LSE directly in sorted order — no need to scatter back.
+    lse_kept = torch.logsumexp(sorted_logits.masked_fill(~keep, float("-inf")), dim=-1)  # (N,)
+
+    label_logit = logits.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)  # (N,)
+    label_in_set = ((sorted_idx == safe_labels.unsqueeze(-1)) & keep).any(dim=-1)  # (N,)
+    extra = torch.where(label_in_set, torch.full_like(label_logit, float("-inf")), label_logit)
+    lse = torch.logaddexp(lse_kept, extra)
+
+    loss_per_token = lse - label_logit
+    loss = _reduce(loss_per_token, valid, num_items_in_batch)
+
+    n_valid = valid.sum()
+    label_in_subset = (
+        ((label_in_set & valid).sum().float() / n_valid.clamp(min=1)).item()
+        if n_valid > 0 else 1.0
+    )
+    return loss, label_in_subset
+
+
+def _topk_topp_ce(logits, labels, valid, safe_labels, k, p, num_items_in_batch, ignore_index):
+    """Combined: apply top-p within the top-k set. All work on (N, k) tensors."""
+    topk_vals, topk_idx = torch.topk(logits, k, dim=-1)  # (N, k) sorted desc
+    topk_vals = topk_vals.float()
+    # nucleus over the top-k set only
+    probs = F.softmax(topk_vals, dim=-1)
+    cumprobs = probs.cumsum(dim=-1)
+    keep = (cumprobs - probs) < p
+    keep[..., 0] = True
+    lse_kept = torch.logsumexp(topk_vals.masked_fill(~keep, float("-inf")), dim=-1)  # (N,)
+
+    label_logit = logits.gather(-1, safe_labels.unsqueeze(-1)).float().squeeze(-1)  # (N,)
+    label_in_set = ((topk_idx == safe_labels.unsqueeze(-1)) & keep).any(dim=-1)  # (N,)
+    extra = torch.where(label_in_set, torch.full_like(label_logit, float("-inf")), label_logit)
+    lse = torch.logaddexp(lse_kept, extra)
+
+    loss_per_token = lse - label_logit
+    loss = _reduce(loss_per_token, valid, num_items_in_batch)
+
+    n_valid = valid.sum()
+    label_in_subset = (
+        ((label_in_set & valid).sum().float() / n_valid.clamp(min=1)).item()
+        if n_valid > 0 else 1.0
+    )
+    return loss, label_in_subset
 
 
 def topk_ce_loss(
@@ -35,49 +112,34 @@ def topk_ce_loss(
 ) -> tuple[torch.Tensor, float]:
     """Cross-entropy with the softmax normalizer restricted to the top-k and/or top-p logits.
 
-    Expects already-shifted `logits` of shape (N, V) and `labels` of shape (N,). The caller
-    is responsible for the next-token shift.
+    Expects already-shifted `logits` of shape (N, V) and `labels` of shape (N,). The ground-
+    truth token is always included in the normalizer so the loss is finite.
 
-    When both `k` and `p` are set, top-k is applied first and top-p within that set.
-    The ground-truth logit is always kept in the subset, so CE stays finite when the label
-    falls outside the top-k/p band.
+    Efficiency notes:
+      - top-k path never materializes a (N, V) mask; all work on (N, k+1) tensors.
+      - top-p path still needs an (N, V) sort (inherent to nucleus selection) but avoids
+        the extra scatter-back + masked_fill round-trip and the full-vocab log_softmax.
+      - combined path runs top-p within the top-k set, so everything is (N, k).
 
-    Follows HF's gradient-accumulation convention: if `num_items_in_batch` is provided, the
-    loss is summed and divided by `num_items_in_batch`; otherwise reduction is "mean".
+    Follows HF's gradient-accumulation convention: `num_items_in_batch` provided → reduction
+    is `sum / num_items_in_batch`; otherwise `mean` over valid positions.
 
-    Returns `(loss, label_in_subset_fraction)` where the second element is the fraction of
-    valid-label positions whose ground-truth token was inside the top-k/p set (a useful
-    diagnostic — low values mean the restriction is too aggressive).
+    Returns `(loss, label_in_subset_fraction)` — second element is the fraction of valid
+    labels already inside the kept set (diagnostic; low values mean the restriction is
+    too aggressive).
     """
     V = logits.size(-1)
     use_topk = k is not None and 0 < k < V
     use_topp = p is not None and 0.0 < p < 1.0
 
-    logits = logits.float()  # matches HF ForCausalLMLoss precision handling
+    if not (use_topk or use_topp):
+        return _plain_ce(logits, labels, num_items_in_batch, ignore_index), 1.0
 
-    if use_topk or use_topp:
-        keep = torch.ones_like(logits, dtype=torch.bool)
-        if use_topk:
-            keep &= _topk_keep_mask(logits, k)
-        if use_topp:
-            keep &= _topp_keep_mask(logits, p)
+    valid = labels != ignore_index
+    safe_labels = torch.where(valid, labels, torch.zeros_like(labels))
 
-        valid = labels != ignore_index
-        safe_idx = torch.where(valid, labels, torch.zeros_like(labels)).unsqueeze(-1)
-
-        # Diagnostic: fraction of valid labels already inside the kept set.
-        in_subset = keep.gather(-1, safe_idx).squeeze(-1) & valid
-        n_valid = valid.sum()
-        label_in_subset = (in_subset.sum().float() / n_valid.clamp(min=1)).item() if n_valid > 0 else 1.0
-
-        # Force the label index to be kept so CE is finite.
-        keep.scatter_(-1, safe_idx, True)
-        logits = logits.masked_fill(~keep, float("-inf"))
-    else:
-        label_in_subset = 1.0
-
-    reduction = "sum" if num_items_in_batch is not None else "mean"
-    loss = F.cross_entropy(logits, labels, ignore_index=ignore_index, reduction=reduction)
-    if num_items_in_batch is not None:
-        loss = loss / num_items_in_batch
-    return loss, label_in_subset
+    if use_topk and use_topp:
+        return _topk_topp_ce(logits, labels, valid, safe_labels, k, p, num_items_in_batch, ignore_index)
+    if use_topk:
+        return _topk_ce(logits, labels, valid, safe_labels, k, num_items_in_batch, ignore_index)
+    return _topp_ce(logits, labels, valid, safe_labels, p, num_items_in_batch, ignore_index)
