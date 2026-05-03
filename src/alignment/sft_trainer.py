@@ -3,19 +3,21 @@ from typing import Any, Optional
 import torch
 import trl
 
-from .losses import topk_ce_loss
+from .losses import mask_topk_ce_loss, topk_ce_loss
 
 
 class SFTTrainer(trl.SFTTrainer):
-    """`trl.SFTTrainer` with optional top-k / top-p restricted cross-entropy.
+    """`trl.SFTTrainer` with optional top-k / top-p restricted (or masked) cross-entropy.
 
-    When `args.topk_ce_k` or `args.topk_ce_p` is set, the softmax normalizer in the
-    training loss is restricted to the top-k and/or top-p logits per position (the
-    label's own logit is always kept). When both are None, behavior is identical to
-    the upstream trainer.
+    Three modes, controlled by `SFTConfig` fields:
+      - `topk_ce_k` / `topk_ce_p`: *restrict* the CE normalizer to the top-k/p logits
+        (penalize only confident competitors; label is always kept).
+      - `mask_topk_ce_k` / `mask_topk_ce_p`: *exclude* the top-k/p logits from the CE
+        normalizer (preserve the model's confident predictions; label is always kept).
+      - None set: identical to the upstream trainer.
 
-    The token-accuracy metric is computed against the unrestricted logits, matching
-    the upstream trainer's semantics.
+    The two modes are mutually exclusive. The token-accuracy metric is always computed
+    against the unrestricted logits.
     """
 
     def compute_loss(
@@ -25,19 +27,27 @@ class SFTTrainer(trl.SFTTrainer):
         return_outputs: bool = False,
         num_items_in_batch: Optional[int] = None,
     ):
-        k = getattr(self.args, "topk_ce_k", None)
-        p = getattr(self.args, "topk_ce_p", None)
-        use_topk = k is not None and k > 0
-        use_topp = p is not None and 0.0 < p < 1.0
+        keep_k = getattr(self.args, "topk_ce_k", None)
+        keep_p = getattr(self.args, "topk_ce_p", None)
+        mask_k = getattr(self.args, "mask_topk_ce_k", None)
+        mask_p = getattr(self.args, "mask_topk_ce_p", None)
+        use_keep = (keep_k is not None and keep_k > 0) or (keep_p is not None and 0.0 < keep_p < 1.0)
+        use_mask = (mask_k is not None and mask_k > 0) or (mask_p is not None and 0.0 < mask_p < 1.0)
 
-        if not (use_topk or use_topp):
+        if use_keep and use_mask:
+            raise ValueError(
+                "`topk_ce_k`/`topk_ce_p` (keep top-k) and `mask_topk_ce_k`/`mask_topk_ce_p` "
+                "(mask top-k) are mutually exclusive. Set at most one pair."
+            )
+
+        if not (use_keep or use_mask):
             return super().compute_loss(
                 model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
             )
 
         if self.args.use_liger_kernel:
             raise ValueError(
-                "topk_ce_k / topk_ce_p are incompatible with `use_liger_kernel=True` because "
+                "topk_ce_* options are incompatible with `use_liger_kernel=True` because "
                 "Liger fuses logits with the CE kernel and does not expose logits for masking."
             )
 
@@ -55,13 +65,24 @@ class SFTTrainer(trl.SFTTrainer):
         flat_logits = shift_logits.view(-1, V)
         flat_labels = shift_labels.view(-1)
 
-        loss, label_in_subset = topk_ce_loss(
-            flat_logits,
-            flat_labels,
-            num_items_in_batch=num_items_in_batch,
-            k=k if use_topk else None,
-            p=p if use_topp else None,
-        )
+        if use_keep:
+            loss, diag_frac = topk_ce_loss(
+                flat_logits,
+                flat_labels,
+                num_items_in_batch=num_items_in_batch,
+                k=keep_k,
+                p=keep_p,
+            )
+            diag_key = "label_in_topk_fraction"
+        else:
+            loss, diag_frac = mask_topk_ce_loss(
+                flat_logits,
+                flat_labels,
+                num_items_in_batch=num_items_in_batch,
+                k=mask_k,
+                p=mask_p,
+            )
+            diag_key = "label_in_masked_fraction"
 
         # Put labels back so downstream logging (e.g. accuracy) can still find them.
         inputs["labels"] = labels
@@ -92,6 +113,6 @@ class SFTTrainer(trl.SFTTrainer):
             total_sum = total.sum()
             accuracy = (correct.sum() / total_sum).item() if total_sum > 0 else 0.0
             self._metrics[mode]["mean_token_accuracy"].append(accuracy)
-            self._metrics[mode]["label_in_topk_fraction"].append(label_in_subset)
+            self._metrics[mode][diag_key].append(diag_frac)
 
         return (loss, outputs) if return_outputs else loss

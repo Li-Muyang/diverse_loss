@@ -156,6 +156,28 @@ class SFTConfig(trl.SFTConfig):
             )
         },
     )
+    mask_topk_ce_k: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Inverse of `topk_ce_k`: *exclude* the top-k logits from the cross-entropy "
+                "softmax normalizer per position. The ground-truth logit is always kept. "
+                "Intuition: avoid pushing mass off the model's confident predictions, "
+                "preserving learned linguistic structure. Mutually exclusive with "
+                "`topk_ce_k`/`topk_ce_p`. Disabled when None."
+            )
+        },
+    )
+    mask_topk_ce_p: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Inverse of `topk_ce_p`: *exclude* the minimal top-p nucleus from the "
+                "cross-entropy softmax normalizer per position. Mutually exclusive with "
+                "`topk_ce_k`/`topk_ce_p`. Disabled when None."
+            )
+        },
+    )
 
 
 @dataclass
