@@ -178,6 +178,17 @@ class SFTConfig(trl.SFTConfig):
             )
         },
     )
+    margin_loss: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "If set (e.g. 1.0), use a multiclass margin (hinge) loss instead of CE: "
+                "`max(0, margin - (logit[label] - max_other_logit))`. Once the label beats "
+                "its nearest competitor by at least `margin`, the position contributes zero "
+                "gradient. Mutually exclusive with topk_ce_* options. Disabled when None."
+            )
+        },
+    )
 
 
 @dataclass

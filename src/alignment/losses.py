@@ -259,6 +259,50 @@ def mask_topk_ce_loss(
     return loss, label_in_mask_frac
 
 
+def margin_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    margin: float,
+    num_items_in_batch: Optional[int] = None,
+    ignore_index: int = -100,
+) -> tuple[torch.Tensor, float]:
+    """Multiclass margin (hinge) loss: `max(0, margin - (logit[label] - max_{j != label} logit[j]))`.
+
+    Only penalizes positions where the label doesn't beat its nearest competitor by at
+    least `margin`. Once the gap is wide enough, gradient is zero — the model is "done"
+    with that token.
+
+    Implemented with a single `torch.topk(logits, 2)` — no `(N, V)` masks.
+
+    Expects already-shifted `logits` of shape (N, V) and `labels` of shape (N,). Follows
+    HF's grad-accum convention for `num_items_in_batch`.
+
+    Returns `(loss, top1_accuracy)` where the second element is the fraction of valid
+    positions at which the label is the argmax (diagnostic — if already 1.0, margin loss
+    has no more to do).
+    """
+    valid = labels != ignore_index
+    safe_labels = torch.where(valid, labels, torch.zeros_like(labels))
+
+    label_logit = logits.gather(-1, safe_labels.unsqueeze(-1)).float().squeeze(-1)  # (N,)
+
+    top2_vals, top2_idx = torch.topk(logits, 2, dim=-1)  # (N, 2), sorted desc
+    top2_vals = top2_vals.float()
+    label_is_top1 = top2_idx[:, 0] == safe_labels  # (N,)
+    best_other = torch.where(label_is_top1, top2_vals[:, 1], top2_vals[:, 0])  # (N,)
+
+    gap = label_logit - best_other
+    loss_per_token = F.relu(margin - gap)
+    loss = _reduce(loss_per_token, valid, num_items_in_batch)
+
+    n_valid = valid.sum()
+    top1_acc = (
+        ((label_is_top1 & valid).sum().float() / n_valid.clamp(min=1)).item()
+        if n_valid > 0 else 0.0
+    )
+    return loss, top1_acc
+
+
 def topk_ce_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
