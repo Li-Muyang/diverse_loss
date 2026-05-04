@@ -31,10 +31,9 @@ class SFTTrainer(trl.SFTTrainer):
         keep_p = getattr(self.args, "topk_ce_p", None)
         mask_k = getattr(self.args, "mask_topk_ce_k", None)
         mask_p = getattr(self.args, "mask_topk_ce_p", None)
-        margin = getattr(self.args, "margin_loss", None)
         use_keep = (keep_k is not None and keep_k > 0) or (keep_p is not None and 0.0 < keep_p < 1.0)
         use_mask = (mask_k is not None and mask_k > 0) or (mask_p is not None and 0.0 < mask_p < 1.0)
-        use_margin = margin is not None and margin > 0.0
+        use_margin = bool(getattr(self.args, "margin_loss", False))
 
         if sum([use_keep, use_mask, use_margin]) > 1:
             raise ValueError(
@@ -89,7 +88,6 @@ class SFTTrainer(trl.SFTTrainer):
             loss, diag_frac = margin_loss(
                 flat_logits,
                 flat_labels,
-                margin=margin,
                 num_items_in_batch=num_items_in_batch,
             )
             diag_key = "margin_top1_accuracy"

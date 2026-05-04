@@ -262,24 +262,22 @@ def mask_topk_ce_loss(
 def margin_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
-    margin: float,
     num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
 ) -> tuple[torch.Tensor, float]:
-    """Multiclass margin (hinge) loss: `max(0, margin - (logit[label] - max_{j != label} logit[j]))`.
+    """Pairwise-softmax margin loss — binary CE between the label logit and its best
+    competitor's logit. Equivalent to `softplus(-gap) = -log(sigmoid(gap))` where
+    `gap = logit[label] - max_{j != label} logit[j]`.
 
-    Only penalizes positions where the label doesn't beat its nearest competitor by at
-    least `margin`. Once the gap is wide enough, gradient is zero — the model is "done"
-    with that token.
+    This is the smooth version of hinge: gradient is non-zero everywhere and pushes the
+    label-vs-competitor gap wider indefinitely, with the push fading exponentially as the
+    gap grows. No margin hyperparameter — it's just binary classification over the
+    label and its nearest rival.
 
     Implemented with a single `torch.topk(logits, 2)` — no `(N, V)` masks.
 
-    Expects already-shifted `logits` of shape (N, V) and `labels` of shape (N,). Follows
-    HF's grad-accum convention for `num_items_in_batch`.
-
-    Returns `(loss, top1_accuracy)` where the second element is the fraction of valid
-    positions at which the label is the argmax (diagnostic — if already 1.0, margin loss
-    has no more to do).
+    Returns `(loss, top1_accuracy)` — fraction of valid positions where the label is the
+    argmax (a useful diagnostic, though unlike hinge the loss keeps training past top1=1.0).
     """
     valid = labels != ignore_index
     safe_labels = torch.where(valid, labels, torch.zeros_like(labels))
@@ -292,7 +290,7 @@ def margin_loss(
     best_other = torch.where(label_is_top1, top2_vals[:, 1], top2_vals[:, 0])  # (N,)
 
     gap = label_logit - best_other
-    loss_per_token = F.relu(margin - gap)
+    loss_per_token = F.softplus(-gap)
     loss = _reduce(loss_per_token, valid, num_items_in_batch)
 
     n_valid = valid.sum()

@@ -178,14 +178,15 @@ class SFTConfig(trl.SFTConfig):
             )
         },
     )
-    margin_loss: Optional[float] = field(
-        default=None,
+    margin_loss: bool = field(
+        default=False,
         metadata={
             "help": (
-                "If set (e.g. 1.0), use a multiclass margin (hinge) loss instead of CE: "
-                "`max(0, margin - (logit[label] - max_other_logit))`. Once the label beats "
-                "its nearest competitor by at least `margin`, the position contributes zero "
-                "gradient. Mutually exclusive with topk_ce_* options. Disabled when None."
+                "If True, use a pairwise-softmax margin loss instead of CE: binary CE "
+                "between the label logit and its best competitor's logit "
+                "(`softplus(-(logit[label] - max_other_logit))`). Smooth version of hinge — "
+                "keeps pushing the label/competitor gap wider, with exponentially fading "
+                "gradient as the gap grows. Mutually exclusive with topk_ce_* options."
             )
         },
     )
