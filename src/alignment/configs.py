@@ -234,6 +234,26 @@ class SFTConfig(trl.SFTConfig):
             )
         },
     )
+    focal_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, use focal loss (Lin et al. 2017) instead of CE: "
+                "`-(1 - p_t)^gamma * log(p_t)` where p_t is the model's probability on "
+                "the label token. Down-weights easy (confident) positions so training "
+                "focuses on hard ones. Mutually exclusive with other alternative losses."
+            )
+        },
+    )
+    focal_gamma: float = field(
+        default=2.0,
+        metadata={
+            "help": (
+                "Focal-loss focusing parameter. `gamma = 0` reduces to plain CE; higher "
+                "gamma increases the down-weighting of easy positions. Paper default: 2.0."
+            )
+        },
+    )
 
 
 @dataclass

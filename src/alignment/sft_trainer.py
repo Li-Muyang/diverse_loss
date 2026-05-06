@@ -3,13 +3,20 @@ from typing import Any, Optional
 import torch
 import trl
 
-from .losses import gem_loss, margin_loss, mask_topk_ce_loss, random_k_ce_loss, topk_ce_loss
+from .losses import (
+    focal_loss,
+    gem_loss,
+    margin_loss,
+    mask_topk_ce_loss,
+    random_k_ce_loss,
+    topk_ce_loss,
+)
 
 
 class SFTTrainer(trl.SFTTrainer):
     """`trl.SFTTrainer` with optional alternative training losses.
 
-    Six modes, controlled by `SFTConfig` fields (all mutually exclusive):
+    Seven modes, controlled by `SFTConfig` fields (all mutually exclusive):
       - `topk_ce_k` / `topk_ce_p`: *restrict* the CE normalizer to the top-k/p logits
         (penalize only confident competitors; label is always kept).
       - `mask_topk_ce_k` / `mask_topk_ce_p`: *exclude* the top-k/p logits from the CE
@@ -19,6 +26,8 @@ class SFTTrainer(trl.SFTTrainer):
         preserving alternative to CE.
       - `random_k_ce_k`: sampled-softmax CE — normalizer over `k` uniformly random vocab
         indices (unbiased negative sampling).
+      - `focal_loss` + `focal_gamma`: focal loss — down-weights easy positions via
+        `(1 - p_t)^gamma`.
       - None set: identical to the upstream trainer.
 
     The token-accuracy metric is always computed against the unrestricted logits.
@@ -41,14 +50,16 @@ class SFTTrainer(trl.SFTTrainer):
         use_gem = bool(getattr(self.args, "gem_loss", False))
         random_k = getattr(self.args, "random_k_ce_k", None)
         use_random = random_k is not None and random_k > 0
+        use_focal = bool(getattr(self.args, "focal_loss", False))
 
-        if sum([use_keep, use_mask, use_margin, use_gem, use_random]) > 1:
+        if sum([use_keep, use_mask, use_margin, use_gem, use_random, use_focal]) > 1:
             raise ValueError(
-                "`topk_ce_*`, `mask_topk_ce_*`, `margin_loss`, `gem_loss`, and "
-                "`random_k_ce_k` are mutually exclusive. Set at most one."
+                "`topk_ce_*`, `mask_topk_ce_*`, `margin_loss`, `gem_loss`, "
+                "`random_k_ce_k`, and `focal_loss` are mutually exclusive. "
+                "Set at most one."
             )
 
-        if not (use_keep or use_mask or use_margin or use_gem or use_random):
+        if not (use_keep or use_mask or use_margin or use_gem or use_random or use_focal):
             return super().compute_loss(
                 model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
             )
@@ -107,7 +118,7 @@ class SFTTrainer(trl.SFTTrainer):
                 h=self.args.gem_h,
             )
             diag_key = "gem_q_on_label"
-        else:  # random-k
+        elif use_random:
             loss, diag_frac = random_k_ce_loss(
                 flat_logits,
                 flat_labels,
@@ -115,6 +126,14 @@ class SFTTrainer(trl.SFTTrainer):
                 num_items_in_batch=num_items_in_batch,
             )
             diag_key = "label_in_random_fraction"
+        else:  # focal
+            loss, diag_frac = focal_loss(
+                flat_logits,
+                flat_labels,
+                gamma=self.args.focal_gamma,
+                num_items_in_batch=num_items_in_batch,
+            )
+            diag_key = "focal_mean_p_t"
 
         # Put labels back so downstream logging (e.g. accuracy) can still find them.
         inputs["labels"] = labels

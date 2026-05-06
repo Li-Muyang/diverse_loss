@@ -259,6 +259,46 @@ def mask_topk_ce_loss(
     return loss, label_in_mask_frac
 
 
+def focal_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    gamma: float = 2.0,
+    num_items_in_batch: Optional[int] = None,
+    ignore_index: int = -100,
+) -> tuple[torch.Tensor, float]:
+    """Focal loss (Lin et al. 2017, "Focal Loss for Dense Object Detection") adapted to
+    next-token prediction: `FL = -(1 - p_t)^gamma * log(p_t)` where `p_t = p[label]`.
+
+    Intuition: down-weights easy (already-confident) positions so the model focuses its
+    capacity on hard positions (low p_t). `gamma = 0` reduces to plain CE; higher gamma
+    makes the focusing more aggressive. The paper's recommended default is `gamma = 2`.
+
+    Implementation reuses `F.cross_entropy` to get `-log p_t` in one fused kernel, so this
+    is essentially free on top of plain CE — no `(N, V)` mask allocations.
+
+    Returns `(loss, mean_p_t)` — the second element is the mean `p_t` across valid
+    positions (a useful diagnostic: high values mean the model is already confident
+    everywhere, so focal loss is a noop; low values mean focal loss is re-weighting
+    most of the batch).
+    """
+    ce_per_token = F.cross_entropy(
+        logits, labels, ignore_index=ignore_index, reduction="none"
+    )  # (N,), = -log p_t for valid, 0 for ignored
+    valid = labels != ignore_index
+    pt = torch.exp(-ce_per_token)  # (N,), = p_t for valid, 1 for ignored
+    modulating = (1.0 - pt).clamp(min=0.0).pow(gamma)
+    loss_per_token = modulating * ce_per_token
+
+    loss = _reduce(loss_per_token, valid, num_items_in_batch)
+
+    n_valid = valid.sum()
+    mean_pt = (
+        (torch.where(valid, pt, torch.zeros_like(pt)).sum() / n_valid.clamp(min=1)).item()
+        if n_valid > 0 else 0.0
+    )
+    return loss, mean_pt
+
+
 def random_k_ce_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
