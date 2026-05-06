@@ -190,6 +190,50 @@ class SFTConfig(trl.SFTConfig):
             )
         },
     )
+    gem_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, use the GEM loss (Li et al. ICLR 2025, 'Preserving Diversity in "
+                "Supervised Fine-tuning of Large Language Models') instead of CE. "
+                "Pulls the label up in log-space, weighted by a sharpened target "
+                "distribution `q = softmax(logits / gem_beta)` so already-plausible "
+                "non-label tokens are not aggressively squashed. Mutually exclusive with "
+                "other alternative losses."
+            )
+        },
+    )
+    gem_beta: float = field(
+        default=0.7,
+        metadata={
+            "help": (
+                "GEM temperature in (0, 1]. Closer to 1 makes GEM behave more like CE; "
+                "closer to 0 preserves more diversity."
+            )
+        },
+    )
+    gem_h: str = field(
+        default="linear",
+        metadata={
+            "help": (
+                "GEM `h` function: 'linear' (default, paper's default) or 'logsigmoid' "
+                "(adaptive re-weighting by `sigmoid(0.01 * (logit - label_logit))`). "
+                "The difference is usually negligible."
+            )
+        },
+    )
+    random_k_ce_k: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "If set, restrict the cross-entropy softmax normalizer to `k` uniformly "
+                "random vocab indices per position (sampled softmax / negative sampling). "
+                "Unbiased in expectation over samples; removes the self-reinforcing bias "
+                "of `topk_ce_k`. The label's logit is always kept. Mutually exclusive with "
+                "other alternative losses. Disabled when None."
+            )
+        },
+    )
 
 
 @dataclass

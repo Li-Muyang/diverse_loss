@@ -259,6 +259,136 @@ def mask_topk_ce_loss(
     return loss, label_in_mask_frac
 
 
+def random_k_ce_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    k: int,
+    num_items_in_batch: Optional[int] = None,
+    ignore_index: int = -100,
+) -> tuple[torch.Tensor, float]:
+    """CE with the softmax normalizer restricted to `k` *uniformly random* vocab indices
+    per position (the "sampled softmax" / negative-sampling variant of `topk_ce_loss`).
+
+    Motivation: `topk_ce_loss` always penalizes the model's own confident predictions,
+    which can create a feedback loop where a small set of tokens are repeatedly pushed
+    down. Random sampling gives every vocab token an equal chance of being a negative
+    across training, removing that bias. In expectation over samples, this is an unbiased
+    estimator of full-vocab CE up to a constant (see Mnih & Teh 2012, NCE; Mikolov et al.
+    2013, word2vec skip-gram).
+
+    Sampling: independent `torch.randint(0, V, (N, k))` per forward pass. With replacement
+    for speed — for k=512 / V=150k, expected duplicates per row ≈ 1, so effective k ≈ 511.
+    The label's logit is always appended to the normalizer if not already in the random
+    set (no double-counting), so CE stays finite.
+
+    Returns `(loss, label_in_sample_fraction)`. The diagnostic should be approximately
+    k/V under the random-sampling hypothesis — a useful sanity check that sampling is
+    uniform.
+    """
+    V = logits.size(-1)
+    if k <= 0 or k >= V:
+        return _plain_ce(logits, labels, num_items_in_batch, ignore_index), 1.0
+
+    valid = labels != ignore_index
+    safe_labels = torch.where(valid, labels, torch.zeros_like(labels))
+
+    N = logits.size(0)
+    rand_idx = torch.randint(0, V, (N, k), device=logits.device)  # (N, k)
+    rand_vals = logits.gather(-1, rand_idx).float()  # (N, k)
+
+    label_logit = logits.gather(-1, safe_labels.unsqueeze(-1)).float()  # (N, 1)
+    label_in_sample = (rand_idx == safe_labels.unsqueeze(-1)).any(dim=-1, keepdim=True)  # (N, 1)
+    # If the label is already in the random set, its logit is already counted — mask the
+    # append-slot to -inf to avoid double-counting.
+    extra = torch.where(label_in_sample, torch.full_like(label_logit, float("-inf")), label_logit)
+    lse = torch.logsumexp(torch.cat([rand_vals, extra], dim=-1), dim=-1)  # (N,)
+
+    loss_per_token = lse - label_logit.squeeze(-1)
+    loss = _reduce(loss_per_token, valid, num_items_in_batch)
+
+    n_valid = valid.sum()
+    frac = (
+        ((label_in_sample.squeeze(-1) & valid).sum().float() / n_valid.clamp(min=1)).item()
+        if n_valid > 0 else 0.0
+    )
+    return loss, frac
+
+
+def gem_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    num_items_in_batch: Optional[int] = None,
+    beta: float = 0.7,
+    h: str = "linear",
+    ignore_index: int = -100,
+) -> tuple[torch.Tensor, float]:
+    """GEM loss (ICLR 2025, Li et al. "Preserving Diversity in Supervised Fine-tuning
+    of Large Language Models"). Port of the reference implementation at
+    https://github.com/pr-gigantic/GEM/blob/main/sft_trainer_v2.py#L37-L74.
+
+    Per valid position j:
+        p       = softmax(logits)                                  # model distribution (log-space)
+        q       = softmax(logits / beta).detach()                  # sharpened target (no grad)
+        weights = 1                                         if h == "linear"
+                  sigmoid(0.01 * (logits - logit[label]))   if h == "logsigmoid"
+        L       = -sum_j q_j * weights_j * (log p[label] - log p_j)
+
+    Intuition: pull the label up in log-space, but weight the contribution of each
+    competitor by how plausible `q` considers it (controlled by beta). This preserves the
+    model's entropy over already-plausible alternatives and avoids the mode-seeking
+    collapse of CE.
+
+    Args:
+        logits: (N, V) flat logits.
+        labels: (N,) flat labels; positions equal to `ignore_index` are dropped before
+            the computation (matches the reference code's `shift_logits[mask]` filtering).
+        beta: in (0, 1]. Closer to 1 ≈ CE; closer to 0 preserves more diversity.
+        h: `"linear"` (default, matches the paper's TrainingArguments default) or
+            `"logsigmoid"`.
+        num_items_in_batch: HF grad-accum convention — if provided, reduction is
+            `sum / num_items_in_batch`; otherwise `mean` over valid positions.
+
+    Returns:
+        `(loss, q_on_label)` where `q_on_label` is the mean of `q[label]` across valid
+        positions (diagnostic: high → q is CE-like; low → q spread over the top tokens).
+    """
+    valid = labels != ignore_index
+    if not valid.any():
+        # No valid tokens — return 0 with grad-flow preserved so the backward pass is a noop.
+        return logits.sum() * 0.0, 0.0
+
+    logits = logits[valid]
+    labels = labels[valid]
+
+    with torch.no_grad():
+        logits_on_labels = torch.gather(
+            logits, dim=-1, index=labels.unsqueeze(-1)
+        ).squeeze(-1)
+        logits_diff = logits - logits_on_labels.unsqueeze(-1)
+        if h == "linear":
+            weights = torch.ones_like(logits_diff)
+        elif h == "logsigmoid":
+            weights = F.sigmoid(0.01 * logits_diff)
+        else:
+            raise ValueError(f"Unknown GEM h={h!r}; must be 'linear' or 'logsigmoid'")
+
+    gene_log_probs = F.log_softmax(logits, dim=-1)
+    q_probs = torch.exp(F.log_softmax(logits / beta, dim=-1)).detach()
+
+    real_log_probs = torch.gather(gene_log_probs, dim=-1, index=labels.unsqueeze(-1))
+
+    per_token = -torch.sum(q_probs * weights * (real_log_probs - gene_log_probs), dim=-1)
+    if num_items_in_batch is not None:
+        loss = per_token.sum() / num_items_in_batch
+    else:
+        loss = per_token.mean()
+
+    with torch.no_grad():
+        q_on_label = q_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1).mean().item()
+
+    return loss, q_on_label
+
+
 def margin_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
